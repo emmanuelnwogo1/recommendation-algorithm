@@ -1,0 +1,220 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import functools
+import os
+import pandas as pd
+from tf_agents.bandits.agents.examples.v2 import trainer
+import random
+from absl import app
+from absl import flags
+import tensorflow as tf
+import tensorflow_datasets as tfds
+from tf_agents.bandits.agents import lin_ucb_agent
+from tf_agents.bandits.environments import environment_utilities
+from tf_agents.environments import tf_py_environment
+from tf_agents.bandits.metrics import tf_metrics as tf_bandit_metrics
+from tf_agents.trajectories import time_step as ts
+import gin
+import numpy as np
+from typing import Optional, Text
+from tf_agents.bandits.environments import bandit_py_environment
+from tf_agents.bandits.environments import movielens_py_environment
+
+from tf_agents.bandits.environments import dataset_utilities
+from tf_agents.specs import array_spec
+import sys
+gin.enter_interactive_mode()
+
+FLAGS = flags.FLAGS
+FLAGS(sys.argv[:1]) 
+hii = os.path.join('mlk', 'u.data')
+
+
+
+
+@gin.configurable
+class MovieLensPyEnvironment(bandit_py_environment.BanditPyEnvironment):
+    def __init__(self,
+                 data_dir: Text = hii, 
+                 rank_k: int = 10,
+                 batch_size: int = 1,
+                 num_movies: int = 20,
+                 csv_delimiter:Text = '\t',
+                 name: Optional[Text] = 'movielens',
+                 ):
+
+        self._num_actions = num_movies
+        self._batch_size = batch_size
+        self._context_dim = rank_k
+        
+        
+
+        self._data_matrix = dataset_utilities.load_movielens_data(
+        data_dir, delimiter=csv_delimiter
+    )
+
+        self._data_matrix = self._data_matrix[:, :num_movies]
+
+        nonzero_users = list(np.nonzero(np.sum(self._data_matrix, axis=1) > 0.0)[0])
+        self._data_matrix = self._data_matrix[nonzero_users, :]
+        self._effective_num_users = len(nonzero_users)
+        
+        
+
+        u, s, vh = np.linalg.svd(self._data_matrix, full_matrices=False)
+
+        self._u_hat = u[:, :rank_k] * np.sqrt(s[:rank_k])
+        self._v_hat = np.transpose(
+            np.transpose(vh[:rank_k, :]) * np.sqrt(s[:rank_k])
+        )
+
+        self._approx_ratings_matrix = np.matmul(self._u_hat, self._v_hat)
+
+        self._current_users = np.zeros(batch_size)
+        self._previous_users = np.zeros(batch_size)
+
+        self._action_spec = array_spec.BoundedArraySpec(
+            shape=(),
+            dtype=np.int32,
+            minimum=0,
+            maximum=self._num_actions - 1,
+            name='action',
+        )
+        observation_spec = array_spec.ArraySpec(
+            shape=(self._context_dim,), dtype=np.float64, name='observation'
+        )
+
+        self._time_step_spec = ts.time_step_spec(observation_spec)
+        self._observation = np.zeros((self._batch_size, self._context_dim))
+
+        self._optimal_action_table = np.argmax(self._approx_ratings_matrix, axis=1)
+        self._optimal_reward_table = np.max(self._approx_ratings_matrix, axis=1)
+
+        super(MovieLensPyEnvironment, self).__init__(
+            observation_spec, self._action_spec, name=name
+        )
+
+    @property
+    def batch_size(self):
+        return self._batch_size
+
+    @property
+    def batched(self):
+        return True
+
+    def _observe(self):
+        sampled_users = random.sample(
+            range(self._effective_num_users), self._batch_size)
+    
+        self._previous_users = self._current_users
+        self._current_users = sampled_users
+        batched_observations = self._u_hat[sampled_users]
+        return batched_observations
+
+    def _apply_action(self, action):
+        rewards = []
+
+        for i, j in zip(self._current_users, action):
+            rewards.append(self._approx_ratings_matrix[i, j])
+        return np.array(rewards)
+
+    def compute_optimal_action(self):
+        return self._optimal_action_table[self._previous_users]
+
+    def compute_optimal_reward(self):
+        return self._optimal_reward_table[self._previous_users]
+
+
+
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import functools
+import os
+
+from absl import app
+from absl import flags
+import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
+from tf_agents.bandits.agents import dropout_thompson_sampling_agent as dropout_ts_agent
+from tf_agents.bandits.agents import lin_ucb_agent
+from tf_agents.bandits.agents import neural_epsilon_greedy_agent as eps_greedy_agent
+from tf_agents.bandits.agents.examples.v2 import trainer
+from tf_agents.bandits.environments import environment_utilities
+from tf_agents.bandits.environments import movielens_py_environment
+from tf_agents.bandits.metrics import tf_metrics as tf_bandit_metrics
+from tf_agents.bandits.networks import global_and_arm_feature_network
+from tf_agents.environments import tf_py_environment
+from tf_agents.networks import q_network
+
+
+
+BATCH_SIZE = 1
+TRAINING_LOOPS = 20
+STEPS_PER_LOOP = 2
+RANK_K = 10
+NUM_ACTIONS = 2
+AGENT_ALPHA = 1
+
+root = os.path.join('root_dir')  
+
+    
+
+def main():
+    env = MovieLensPyEnvironment()
+
+    environment = tf_py_environment.TFPyEnvironment(env)
+    
+    agent = lin_ucb_agent.LinearUCBAgent(
+        time_step_spec=environment.time_step_spec(),
+        action_spec=environment.action_spec(),
+        tikhonov_weight=0.001,
+        alpha=AGENT_ALPHA,
+        dtype=tf.float32,
+    )
+
+    # optimal_reward_fn = environment.compute_optimal_reward()
+    optimal_reward_fn = functools.partial(
+          environment_utilities.compute_optimal_reward_with_movielens_environment,
+          environment=environment,
+           )
+
+    optimal_action_fn = functools.partial(
+          environment_utilities.compute_optimal_action_with_movielens_environment,
+          environment=environment,
+           )
+
+        
+    regret_metric = tf_bandit_metrics.RegretMetric(optimal_reward_fn)
+
+    suboptimal_arms_metric = tf_bandit_metrics.SuboptimalArmsMetric(
+        optimal_action_fn
+    )
+
+    print("Training loop started...")
+
+    trainer.train(
+        root_dir=root,
+        agent=agent,
+        environment=environment,
+        training_loops=TRAINING_LOOPS,
+        steps_per_loop=STEPS_PER_LOOP,
+        additional_metrics=[regret_metric, suboptimal_arms_metric],
+    )
+
+    for _ in range(BATCH_SIZE):
+        time_step = environment.reset()
+        action_step = agent.policy.action(time_step)
+        recommended_movie = action_step.action.numpy()[0]
+        print(f"Recommended movie index: {recommended_movie}")
+
+
+if __name__ == '__main__':
+      main()
+      
+      
+
+
